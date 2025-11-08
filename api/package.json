@@ -1,6 +1,0 @@
-{
-  "type": "module",
-  "dependencies": {
-    "alexa-verifier": "^4.0.0"
-  }
-}
