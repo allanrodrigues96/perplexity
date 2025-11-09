@@ -1,172 +1,181 @@
 // api/alexa.js
-// Arquivo final para produção (Vercel + Alexa HTTPS endpoint)
-
+// ESM (package.json: { "type": "module" })
 import verifier from "alexa-verifier";
 
-// ===== Config via Variáveis de Ambiente =====
-const MAKE_WEBHOOK_URL = process.env.MAKE_WEBHOOK_URL || ""; // opcional
-const ALEXA_VERIFY = (process.env.ALEXA_VERIFY || "true").toLowerCase() === "true"; // true = exige assinatura (dispositivo físico)
-const ALEXA_DEBUG = (process.env.ALEXA_DEBUG || "false").toLowerCase() === "true"; // true = mais logs de diagnóstico (opcional)
-
-// ===== Helpers =====
-function log(...args) {
-  if (ALEXA_DEBUG) console.log("[ALEXA]", ...args);
-}
-
-// Lê o corpo cru da requisição (necessário para verificação de assinatura)
-function getRawBody(req) {
+/**
+ * Lê o corpo cru (string) SEM parsear JSON nem alterar espaços.
+ * Isso é crucial para a validação de assinatura da Alexa.
+ */
+function readRawBody(req) {
   return new Promise((resolve, reject) => {
-    const chunks = [];
-    req.on("data", (c) => chunks.push(c));
-    req.on("end", () => resolve(Buffer.concat(chunks)));
-    req.on("error", reject);
+    try {
+      const chunks = [];
+      req.on("data", (c) => chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)));
+      req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+      req.on("error", reject);
+    } catch (err) {
+      reject(err);
+    }
   });
 }
 
-// Envia a pergunta para seu webhook (opcional)
-async function sendToMake(query) {
-  if (!MAKE_WEBHOOK_URL) return null;
-  const r = await fetch(MAKE_WEBHOOK_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ query }),
-  });
-  if (!r.ok) throw new Error(`MAKE webhook HTTP ${r.status}`);
-  return r.json(); // esperamos que retorne um JSON já no formato Alexa
-}
-
-// Respostas auxiliares
-function responseSSML(ssml, { end = true } = {}) {
+/**
+ * Respostas utilitárias
+ */
+function alexaResponseSSML(ssml, shouldEndSession = true) {
   return {
     version: "1.0",
     response: {
-      shouldEndSession: end,
+      shouldEndSession,
       outputSpeech: { type: "SSML", ssml },
     },
   };
 }
 
-function responseText(text, { end = true } = {}) {
+function alexaResponsePlain(text, shouldEndSession = true) {
   return {
     version: "1.0",
     response: {
-      shouldEndSession: end,
+      shouldEndSession,
       outputSpeech: { type: "PlainText", text },
     },
   };
 }
 
-function welcome() {
-  return {
-    version: "1.0",
-    response: {
-      shouldEndSession: false,
-      outputSpeech: { type: "SSML", ssml: "<speak>Oi! O que você quer saber?</speak>" },
-      reprompt: { outputSpeech: { type: "PlainText", text: "Pode perguntar." } },
-    },
-  };
-}
-
-// ===== Handler =====
+/**
+ * Handler principal (Vercel Serverless / Node runtime)
+ */
 export default async function handler(req, res) {
-  // Saúde / debug opcional — se preferir, deixe 405 para GET
-  if (req.method !== "POST") {
-    res.setHeader("Allow", "POST");
-    return res.status(405).send("Method Not Allowed");
-  }
-
   try {
-    // 1) Pegar o corpo cru ANTES de qualquer parse
-    const rawBody = await getRawBody(req);
+    // Só aceitamos POST
+    if (req.method !== "POST") {
+      return res.status(405).send("Method Not Allowed");
+    }
 
-    // 2) Verificação de Assinatura (obrigatória se ALEXA_VERIFY=true)
-    if (ALEXA_VERIFY) {
-      // Node normaliza para minúsculo
-      const signature = req.headers["signature"];
-      const certUrl = req.headers["signaturecertchainurl"];
-      log("verifyOn:", ALEXA_VERIFY, "hasSig:", !!signature, "hasCert:", !!certUrl);
+    // Lê o corpo cru primeiro (sem JSON.parse)
+    const rawBody = await readRawBody(req);
 
+    // Headers que a Alexa envia (Vercel normaliza para lower-case)
+    const signature = req.headers["signature"];
+    const certUrl = req.headers["signaturecertchainurl"];
+
+    // Flag para ativar/desativar verificação (em produção deixe true)
+    const VERIFY = String(process.env.ALEXA_VERIFY || "true").toLowerCase() === "true";
+
+    if (VERIFY) {
       if (!signature || !certUrl) {
-        // Isso sempre acontece no simulador do Developer Console
-        return res.status(200).json(
-          responseSSML("<speak>Não foi possível validar a requisição.</speak>", { end: true })
-        );
+        console.error("Faltam headers de verificação", { signature: !!signature, certUrl: !!certUrl });
+        return res
+          .status(401)
+          .json(alexaResponseSSML("<speak>Não foi possível validar a requisição.</speak>"));
       }
 
-      // A biblioteca espera o corpo em string (utf8)
-      await verifier(certUrl, signature, rawBody.toString("utf8"));
-    } else {
-      log("ALEXA_VERIFY=false (modo desenvolvimento/simulador).");
+      // Validação da assinatura
+      await new Promise((resolve, reject) => {
+        verifier(certUrl, signature, rawBody, (err) => (err ? reject(err) : resolve()));
+      });
     }
 
-    // 3) Agora sim, parse do JSON
-    const alexaReq = JSON.parse(rawBody.toString("utf8"));
-    const type = alexaReq.request?.type;
-    const intent = alexaReq.request?.intent?.name;
+    // Agora sim podemos parsear o JSON
+    let alexaReq;
+    try {
+      alexaReq = JSON.parse(rawBody);
+    } catch (e) {
+      console.error("JSON inválido recebido da Alexa:", e?.message);
+      return res
+        .status(400)
+        .json(alexaResponseSSML("<speak>Desculpe, houve um erro ao processar.</speak>"));
+    }
 
-    // Slot principal (tentamos 'query' ou o slot padrão AMAZON.SearchQuery)
-    const query =
-      alexaReq.request?.intent?.slots?.query?.value ||
-      alexaReq.request?.intent?.slots?.SearchQuery?.value ||
-      "";
+    // Roteamento básico por tipo
+    const type = alexaReq?.request?.type;
+    const intentName = alexaReq?.request?.intent?.name;
 
-    log("type:", type, "intent:", intent, "query:", query);
-
-    // 4) Launch
+    // 1) Abertura da skill
     if (type === "LaunchRequest") {
-      return res.status(200).json(welcome());
+      return res.status(200).json(
+        alexaResponseSSML(
+          "<speak>Oi! O que você quer saber?</speak>",
+          /* shouldEndSession */ false
+        )
+      );
     }
 
-    // 5) Intent principal para perguntas
-    if (type === "IntentRequest" && intent === "AskPerplexityIntent") {
-      try {
-        // Se houver webhook, tentamos usá-lo e aceitar um JSON no formato Alexa
-        if (MAKE_WEBHOOK_URL) {
-          const alexaJson = await sendToMake(query);
+    // 2) Intent principal
+    if (type === "IntentRequest" && intentName === "AskPerplexityIntent") {
+      const query =
+        alexaReq?.request?.intent?.slots?.query?.value?.trim() ||
+        alexaReq?.request?.intent?.slots?.SearchQuery?.value?.trim() ||
+        "";
 
-          // Se já vier no formato Alexa, devolvemos
-          if (alexaJson?.response?.outputSpeech) {
-            return res.status(200).json(alexaJson);
-          }
-
-          // Caso retorne algo simples, tentamos extrair texto
-          const text =
-            alexaJson?.response?.outputSpeech?.text ||
-            alexaJson?.response?.outputSpeech?.ssml ||
-            "Aqui está a resposta, mas não no formato esperado.";
-          return res.status(200).json(responseText(String(text), { end: false }));
-        }
-
-        // Sem webhook: responda algo simples (place-holder local)
-        if (!query) {
-          return res
-            .status(200)
-            .json(responseSSML("<speak>Você pode me perguntar algo como: qual é a capital de Pernambuco?</speak>", { end: false }));
-        }
-
-        // Exemplo de resposta local simples:
-        if (query.toLowerCase().includes("capital de pernambuco")) {
-          return res.status(200).json(responseText("A capital de Pernambuco é Recife.", { end: false }));
-        }
-
-        // Fallback local
+      if (!query) {
         return res
           .status(200)
-          .json(responseSSML("<speak>Desculpe, ainda não sei responder isso.</speak>", { end: false }));
-      } catch (err) {
-        log("Erro ao consultar webhook:", err?.message || err);
-        return res.status(200).json(
-          responseSSML("<speak>Desculpe, houve um erro ao processar.</speak>", { end: true })
-        );
+          .json(
+            alexaResponseSSML(
+              "<speak>Qual é a sua dúvida?</speak>",
+              /* shouldEndSession */ false
+            )
+          );
       }
+
+      // Chama seu cenário no Make (ou qualquer webhook)
+      const url = process.env.MAKE_WEBHOOK_URL;
+      if (!url) {
+        console.error("MAKE_WEBHOOK_URL ausente");
+        return res
+          .status(500)
+          .json(alexaResponseSSML("<speak>Erro de configuração do servidor.</speak>"));
+      }
+
+      // Você pode mandar só { query } e montar a resposta no Make
+      // ou já devolver Alexa JSON pronto pelo próprio Make.
+      const r = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query }),
+      });
+
+      // Se seu Make devolver o objeto Alexa já pronto, apenas retransmita:
+      // Caso contrário, adapte aqui para converter sua resposta em SSML.
+      let makeJson;
+      try {
+        makeJson = await r.json();
+      } catch {
+        makeJson = null;
+      }
+
+      if (makeJson && makeJson.version && makeJson.response) {
+        return res.status(200).json(makeJson);
+      }
+
+      // Fallback: texto simples vindo do Make?
+      const text =
+        (makeJson && (makeJson.text || makeJson.message || makeJson.answer)) ||
+        "Desculpe, não encontrei a resposta.";
+
+      return res.status(200).json(
+        alexaResponseSSML(
+          `<speak>${String(text)}</speak>`,
+          /* shouldEndSession */ true
+        )
+      );
     }
 
-    // 6) Fallback para qualquer outra coisa
-    return res.status(200).json(responseText("Desculpe, não entendi.", { end: true }));
+    // 3) Encerramento
+    if (type === "SessionEndedRequest") {
+      return res.status(200).json(alexaResponsePlain("Tchau!", true));
+    }
+
+    // Caso não reconheça
+    return res
+      .status(200)
+      .json(alexaResponseSSML("<speak>Desculpe, não entendi.</speak>", true));
   } catch (err) {
-    console.error("Erro no handler:", err);
-    return res.status(200).json(
-      responseSSML("<speak>Desculpe, houve um erro ao processar.</speak>", { end: true })
-    );
+    // Qualquer exceção cai aqui
+    console.error("Falha no handler:", err?.message || err);
+    return res
+      .status(500)
+      .json(alexaResponseSSML("<speak>Desculpe, houve um erro ao processar.</speak>"));
   }
 }
