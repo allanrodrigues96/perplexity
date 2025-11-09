@@ -2,232 +2,150 @@
 import verifier from "alexa-verifier";
 
 const MAKE_WEBHOOK_URL = process.env.MAKE_WEBHOOK_URL || "";
-const ALEXA_VERIFY = String(process.env.ALEXA_VERIFY || "true").toLowerCase() === "true";
+const ALEXA_VERIFY = (process.env.ALEXA_VERIFY || "true").toLowerCase() !== "false";
 
-// ---------- helpers de resposta ----------
-function alexaPlain(text, shouldEnd = true) {
+// -----------------------------
+// Helpers
+// -----------------------------
+function alexaResponse({ text, end = true }) {
+  // Resposta mínima compatível com Alexa
   return {
     version: "1.0",
     response: {
-      shouldEndSession: shouldEnd,
-      outputSpeech: { type: "PlainText", text: String(text ?? "") },
+      shouldEndSession: end,
+      outputSpeech: {
+        type: "SSML",
+        ssml: `<speak>${text}</speak>`,
+      },
     },
   };
 }
 
-function alexaSSML(ssml, shouldEnd = true) {
-  // Garante <speak>...</speak>
-  const clean = String(ssml ?? "").trim();
-  const wrapped = clean.startsWith("<speak>") ? clean : `<speak>${clean}</speak>`;
-  return {
-    version: "1.0",
-    response: {
-      shouldEndSession: shouldEnd,
-      outputSpeech: { type: "SSML", ssml: wrapped },
-    },
-  };
+async function readRawBody(req) {
+  const chunks = [];
+  for await (const c of req) chunks.push(c);
+  return Buffer.concat(chunks);
 }
 
-function alexaError(text = "Desculpe, houve um erro ao processar.") {
-  return alexaSSML(`<speak>${text}</speak>`, true);
-}
-
-function buildAskPrompt() {
-  return alexaSSML(
-    "<speak>Oi! O que você quer saber?</speak>",
-    false // mantém a sessão aberta
-  );
-}
-
-// ---------- leitura de raw body ----------
-async function getRawBody(req, limit = 1024 * 1024) {
+function verifyAlexaSignature({ certUrl, signature, rawString }) {
   return new Promise((resolve, reject) => {
-    const chunks = [];
-    let size = 0;
-    req.on("data", (c) => {
-      size += c.length;
-      if (size > limit) {
-        reject(new Error("Body too large"));
-        return;
-      }
-      chunks.push(c);
-    });
-    req.on("end", () => resolve(Buffer.concat(chunks)));
-    req.on("error", reject);
+    // MUITO IMPORTANTE: enviar STRING CRUA para o alexa-verifier!
+    verifier(certUrl, signature, rawString, (err) => (err ? reject(err) : resolve()));
   });
 }
 
-// ---------- verificação Alexa ----------
-async function verifyAlexaRequest(req, rawBodyStr) {
-  const signature = req.headers["signature"];
+// -----------------------------
+// Handler
+// -----------------------------
+export default async function handler(req, res) {
+  if (req.method !== "POST") {
+    return res.status(405).send("Method Not Allowed");
+  }
+
+  // 1) Leia o corpo cru ANTES de qualquer parse
+  const rawBuffer = await readRawBody(req);
+  const rawString = rawBuffer.toString("utf8"); // <-- chave para não quebrar a verificação
+  const sig = req.headers["signature"];
   const certUrl = req.headers["signaturecertchainurl"];
 
-  // Logs pequenos para diagnosticar no Vercel
-  console.log(
-    "[verify] hasSig=%s hasCert=%s verify=%s",
-    Boolean(signature),
-    Boolean(certUrl),
-    ALEXA_VERIFY
-  );
-
-  if (!ALEXA_VERIFY) return;
-
-  if (!signature || !certUrl) {
-    throw new Error("Missing signature or cert url");
-  }
-
-  // IMPORTANTE: passar STRING para o verifier (evita falsos negativos)
-  await new Promise((resolve, reject) => {
-    verifier(certUrl, signature, rawBodyStr, (err) => (err ? reject(err) : resolve()));
-  });
-}
-
-// ---------- chamada ao Make ----------
-async function askMake(query, sessionId) {
-  if (!MAKE_WEBHOOK_URL) throw new Error("MAKE_WEBHOOK_URL is empty");
-
-  const payload = {
-    query: String(query || "").trim(),
-    sessionId: String(sessionId || ""),
-    source: "alexa",
-  };
-
-  // timeout de 8s para evitar travar a resposta
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 8000);
-
-  let resp;
   try {
-    resp = await fetch(MAKE_WEBHOOK_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-      signal: controller.signal,
-    });
-  } finally {
-    clearTimeout(timer);
-  }
-
-  if (!resp.ok) {
-    const txt = await resp.text().catch(() => "");
-    console.error("[make] bad status", resp.status, txt);
-    throw new Error(`Make returned ${resp.status}`);
-  }
-
-  // Pode ser Alexa JSON completo OU um objeto com text/ssml
-  let data;
-  const rawText = await resp.text();
-  try {
-    data = JSON.parse(rawText);
-  } catch (e) {
-    // fallback se Make retornar texto puro
-    data = { text: rawText };
-  }
-  return data;
-}
-
-// ---------- handler principal ----------
-export default async function handler(req, res) {
-  try {
-    if (req.method !== "POST") {
-      res.status(405).send("Method Not Allowed");
-      return;
+    // 2) Verificação de assinatura (quando habilitada)
+    if (ALEXA_VERIFY) {
+      if (!sig || !certUrl) {
+        console.log("[verify] missing headers", {
+          hasSig: !!sig,
+          hasCert: !!certUrl,
+          len: rawBuffer.length,
+        });
+        return res
+          .status(400)
+          .json(alexaResponse({ text: "Não foi possível validar a requisição." }));
+      }
+      try {
+        await verifyAlexaSignature({ certUrl, signature: sig, rawString });
+      } catch (e) {
+        console.error("[verify] failed: invalid signature", {
+          msg: e?.message,
+          len: rawBuffer.length,
+        });
+        return res
+          .status(400)
+          .json(alexaResponse({ text: "Não foi possível validar a requisição." }));
+      }
+    } else {
+      console.log("[verify] bypass", {
+        hasSig: !!sig,
+        hasCert: !!certUrl,
+        verify: false,
+        len: rawBuffer.length,
+      });
     }
 
-    const rawBody = await getRawBody(req);
-    const rawBodyStr = rawBody.toString("utf8");
-
-    // Log de entrada
-    console.log("Incoming POST /api/alexa", {
-      host: req.headers.host,
-      ua: req.headers["user-agent"],
-      hasSig: Boolean(req.headers["signature"]),
-      hasCert: Boolean(req.headers["signaturecertchainurl"]),
-      verifyEnabled: ALEXA_VERIFY,
-      bodyLen: rawBody.length,
-    });
-
-    // 1) Verifica (se ativado)
-    try {
-      await verifyAlexaRequest(req, rawBodyStr);
-    } catch (e) {
-      console.error("Alexa verify failed:", e?.message || e);
-      res.status(400).json(alexaPlain("Não foi possível validar a requisição."));
-      return;
-    }
-
-    // 2) Parse do JSON
+    // 3) Agora sim, parse do JSON
     let alexaReq;
     try {
-      alexaReq = JSON.parse(rawBodyStr);
+      alexaReq = JSON.parse(rawString);
     } catch (e) {
-      console.error("JSON parse failed:", e?.message || e);
-      res.status(400).json(alexaError("Requisição inválida."));
-      return;
+      console.error("JSON parse error:", e?.message);
+      return res
+        .status(400)
+        .json(alexaResponse({ text: "Requisição inválida." }));
     }
 
     const type = alexaReq.request?.type;
     const intent = alexaReq.request?.intent?.name;
-    const query =
-      alexaReq.request?.intent?.slots?.query?.value ||
-      alexaReq.request?.intent?.slots?.SearchQuery?.value || // se você usar AMAZON.SearchQuery com nome SearchQuery
-      "";
+    const query = alexaReq.request?.intent?.slots?.query?.value || "";
 
-    // 3) Roteamento das intents
+    // 4) Fluxo de intents
     if (type === "LaunchRequest") {
-      res.status(200).json(buildAskPrompt());
-      return;
+      return res.status(200).json(
+        alexaResponse({
+          text: "Oi! O que você quer saber?",
+          end: false,
+        })
+      );
     }
 
-    if (type === "IntentRequest") {
-      // Intent principal
-      if (intent === "AskPerplexityIntent") {
-        if (!query) {
-          res
-            .status(200)
-            .json(alexaSSML("<speak>Qual é a sua pergunta?</speak>", false));
-          return;
-        }
-
-        try {
-          const r = await askMake(query, alexaReq.session?.sessionId || "");
-          // Se o Make já devolver Alexa JSON (tem `version` e `response`)
-          if (r && r.version && r.response) {
-            res.status(200).json(r);
-            return;
-          }
-          // Se devolveu um objeto simples
-          if (r?.ssml) {
-            res.status(200).json(alexaSSML(r.ssml, true));
-            return;
-          }
-          if (r?.text) {
-            res.status(200).json(alexaPlain(r.text, true));
-            return;
-          }
-          // Qualquer outro formato: fallback
-          res
-            .status(200)
-            .json(alexaPlain("Desculpe, não encontrei a resposta.", true));
-          return;
-        } catch (e) {
-          console.error("Erro no handler/Make:", e?.message || e);
-          res.status(200).json(alexaError());
-          return;
-        }
+    if (type === "IntentRequest" && intent === "AskPerplexityIntent") {
+      if (!MAKE_WEBHOOK_URL) {
+        console.warn("MAKE_WEBHOOK_URL ausente");
+        return res
+          .status(200)
+          .json(alexaResponse({ text: "Desculpe, estou sem conexão no momento." }));
       }
 
-      // Fallback para intents desconhecidas
-      res
-        .status(200)
-        .json(alexaPlain("Desculpe, não entendi. Pode repetir?", false));
-      return;
+      try {
+        const r = await fetch(MAKE_WEBHOOK_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ query }),
+        });
+
+        if (!r.ok) {
+          console.error("Webhook HTTP error:", r.status);
+          return res
+            .status(200)
+            .json(alexaResponse({ text: "Desculpe, não encontrei a resposta." }));
+        }
+
+        const alexaJson = await r.json();
+        return res.status(200).json(alexaJson);
+      } catch (e) {
+        console.error("Erro ao chamar webhook:", e?.message);
+        return res
+          .status(200)
+          .json(alexaResponse({ text: "Desculpe, ocorreu um erro ao processar." }));
+      }
     }
 
-    // Tipos não suportados
-    res.status(200).json(alexaPlain("Ok.", true));
+    // 5) Fallback
+    return res
+      .status(200)
+      .json(alexaResponse({ text: "Desculpe, não entendi." }));
   } catch (e) {
-    console.error("Erro no handler (fatal):", e?.stack || e);
-    res.status(500).json(alexaError());
+    console.error("Erro inesperado no handler:", e);
+    return res
+      .status(500)
+      .json(alexaResponse({ text: "Desculpe, houve um erro ao processar." }));
   }
 }
